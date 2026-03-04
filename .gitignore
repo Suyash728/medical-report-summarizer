@@ -1,2 +1,3 @@
 local_ner_model/
 .env
+.venv/

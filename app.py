@@ -3,6 +3,14 @@ import PyPDF2
 from transformers import pipeline
 import torch
 
+# --- NEW LANGCHAIN & RAG IMPORTS ---
+from langchain_text_splitters import RecursiveCharacterTextSplitter 
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_community.vectorstores import FAISS
+from langchain_groq import ChatGroq
+from langchain.chains import create_retrieval_chain
+from langchain.chains.combine_documents import create_stuff_documents_chain
+from langchain_core.prompts import ChatPromptTemplate
 
 # ==========================================
 # 1. APP CONFIGURATION & UI
@@ -18,7 +26,9 @@ st.markdown("""
 # Sidebar settings
 with st.sidebar:
     st.header("⚙️ Settings")
-    target_language = st.selectbox("Target Language", ["English", "Hindi", "Marathi"])
+    # FIX: Added the Groq API Key input back so the user can enter it
+    groq_api_key = st.text_input("Groq API Key", type="password")
+    target_language = st.selectbox("Target Language",["English", "Hindi", "Marathi"])
     st.markdown("---")
     st.info("Upload a medical report to generate a simplified summary and extract key clinical entities.")
 
@@ -88,7 +98,55 @@ def highlight_entities(text, entities):
     return highlighted_text
 
 # ==========================================
-# 5. MAIN EXECUTION FLOW
+# 5. RAG PIPELINE (LANGCHAIN + FAISS + GROQ)
+# ==========================================
+def process_rag_pipeline(text, target_lang, api_key):
+    # 1. Chunking the text (overlapping chunks help with tabular PDF data)
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=150)
+    chunks = text_splitter.split_text(text)
+    
+    # 2. Privacy-First Local Embeddings
+    # We use all-MiniLM-L6-v2 locally so patient data isn't sent to OpenAI/Cloud for embedding
+    embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+    
+    # 3. In-Memory Vector DB (FAISS)
+    vectorstore = FAISS.from_texts(chunks, embeddings)
+    retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
+    
+    # 4. Initialize LLM via Groq (Fast Inference)
+    llm = ChatGroq(
+        temperature=0.1, 
+        groq_api_key="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", 
+        model_name="llama3-8b-8192"
+    )
+    
+    # 5. ASHA Worker / Patient Prompt Engineering
+    system_prompt = (
+        "You are a helpful, empathetic medical assistant designed to help patients and rural ASHA workers understand medical reports. "
+        "Use the provided context to summarize the patient's test results. "
+        "Strictly follow these rules: "
+        "1. Use simple, non-jargon language. "
+        "2. Clearly list any 'Abnormal Values' (too high or too low) and explain what they generally mean. "
+        "3. Keep the tone reassuring. Do NOT diagnose the patient. "
+        f"4. You MUST provide your final response entirely in {target_lang}. "
+        "\n\nContext:\n{context}"
+    )
+    
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", system_prompt),
+        ("human", "{input}"),
+    ])
+    
+    # 6. Create the Retrieval Chain
+    question_answer_chain = create_stuff_documents_chain(llm, prompt)
+    rag_chain = create_retrieval_chain(retriever, question_answer_chain)
+    
+    # 7. Execute the prompt
+    response = rag_chain.invoke({"input": "Please summarize this medical report, list key findings, and highlight any abnormal values."})
+    return response["answer"]
+
+# ==========================================
+# 6. MAIN EXECUTION FLOW
 # ==========================================
 uploaded_file = st.file_uploader("📄 Upload Medical PDF", type=["pdf"])
 
@@ -101,7 +159,6 @@ if uploaded_file is not None:
     else:
         st.success("PDF processed successfully (Privacy-First compliant).")
         
-        # Two-column layout: Left for NER Visualization, Right for Summary (coming later)
         col1, col2 = st.columns(2)
         
         with col1:
@@ -109,26 +166,36 @@ if uploaded_file is not None:
             st.caption("Powered by Local BioBERT")
             
             with st.spinner("Running Local BioBERT..."):
-                # Run NER on the first 1500 chars to avoid overwhelming the UI/Model
                 sample_text = document_text[:1500] 
                 entities = ner_pipeline(sample_text)
-                
-                # Apply HTML Highlighting
                 visual_text = highlight_entities(sample_text, entities)
                 
-                # Render the HTML in Streamlit
                 st.markdown("""
-                <div style="padding: 15px; border: 1px solid #ddd; border-radius: 8px; background-color: #f9f9f9; height: 400px; overflow-y: auto;">
+                <div style="padding: 15px; border: 1px solid #ddd; border-radius: 8px; background-color: #f9f9f9; height: 500px; overflow-y: auto; font-family: monospace; font-size: 14px;">
                     {}
                 </div>
                 """.format(visual_text.replace('\n', '<br>')), unsafe_allow_html=True)
                 
-                # Display Legend
                 st.markdown("**Legend:**")
-                legend_html = " ".join([f'<span style="background-color: {color}; padding: 2px 4px; border-radius: 4px; margin-right: 10px;">{group}</span>' for group, color in ENTITY_COLORS.items()])
+                legend_html = " ".join([f'<span style="background-color: {color}; padding: 2px 4px; border-radius: 4px; margin-right: 10px; font-size: 12px;">{group}</span>' for group, color in ENTITY_COLORS.items()])
                 st.markdown(legend_html, unsafe_allow_html=True)
                 
         with col2:
-            st.subheader("📝 RAG Summary & Translation")
-            st.info("LangChain + FAISS + Llama-3 integration will go here.")
-            # We will implement the RAG pipeline here in the next step!
+            st.subheader(f"📝 Simplified Summary ({target_language})")
+            st.caption("Powered by RAG (FAISS + Llama-3)")
+            
+            if not groq_api_key:
+                st.warning("⚠️ Please enter your Groq API Key in the sidebar to generate the summary.")
+            else:
+                with st.spinner(f"Generating summary in {target_language}..."):
+                    try:
+                        summary_output = process_rag_pipeline(document_text, target_language, groq_api_key)
+                        
+                        st.markdown("""
+                        <div style="padding: 15px; border: 1px solid #ddd; border-radius: 8px; background-color: #eef7ff; height: 500px; overflow-y: auto;">
+                            {}
+                        </div>
+                        """.format(summary_output.replace('\n', '<br>')), unsafe_allow_html=True)
+                        
+                    except Exception as e:
+                        st.error(f"Error in RAG Pipeline: {e}")

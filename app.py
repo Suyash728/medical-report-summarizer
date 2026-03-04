@@ -116,7 +116,7 @@ def process_rag_pipeline(text, target_lang, api_key):
     # 4. Initialize LLM via Groq (Fast Inference)
     llm = ChatGroq(
         temperature=0.1, 
-        groq_api_key="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", 
+        groq_api_key="api_key", 
         model_name="llama3-8b-8192"
     )
     

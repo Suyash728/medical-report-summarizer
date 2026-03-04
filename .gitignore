@@ -1,3 +1,5 @@
 local_ner_model/
 .env
 .venv/
+api_key_test.py
+key_import.py

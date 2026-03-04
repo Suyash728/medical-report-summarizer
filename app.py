@@ -3,14 +3,15 @@ import PyPDF2
 from transformers import pipeline
 import torch
 
-# --- NEW LANGCHAIN & RAG IMPORTS ---
-from langchain_text_splitters import RecursiveCharacterTextSplitter 
+# --- MODERN LANGCHAIN (LCEL) IMPORTS ---
+# Notice we completely removed the buggy "langchain.chains" dependency!
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_groq import ChatGroq
-from langchain.chains import create_retrieval_chain
-from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import RunnablePassthrough
+from langchain_core.output_parsers import StrOutputParser
 
 # ==========================================
 # 1. APP CONFIGURATION & UI
@@ -24,10 +25,12 @@ st.markdown("""
 """)
 
 # Sidebar settings
+# Sidebar settings
 with st.sidebar:
     st.header("⚙️ Settings")
-    # FIX: Added the Groq API Key input back so the user can enter it
-    groq_api_key = st.text_input("Groq API Key", type="password")
+    # HARDCODE YOUR API KEY HERE (Notice it must be inside "quotation marks")
+    groq_api_key = "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" 
+    
     target_language = st.selectbox("Target Language",["English", "Hindi", "Marathi"])
     st.markdown("---")
     st.info("Upload a medical report to generate a simplified summary and extract key clinical entities.")
@@ -35,17 +38,15 @@ with st.sidebar:
 # ==========================================
 # 2. CACHE LOCAL NER MODEL
 # ==========================================
-# @st.cache_resource ensures the model is loaded only once, saving time.
 @st.cache_resource
 def load_ner_pipeline():
     try:
-        # Load from the local directory where you saved d4data/biomedical-ner-all
         ner_pipe = pipeline(
             "ner", 
             model="./local_ner_model", 
             tokenizer="./local_ner_model", 
-            aggregation_strategy="simple", # Groups sub-words into full words
-            device=0 if torch.cuda.is_available() else -1 # Use GPU if available
+            aggregation_strategy="simple",
+            device=0 if torch.cuda.is_available() else -1
         )
         return ner_pipe
     except Exception as e:
@@ -59,7 +60,6 @@ ner_pipeline = load_ner_pipeline()
 # ==========================================
 def extract_text_from_pdf(uploaded_file):
     text = ""
-    # File is read directly from memory (BytesIO), ensuring privacy
     pdf_reader = PyPDF2.PdfReader(uploaded_file)
     for page in pdf_reader.pages:
         extracted = page.extract_text()
@@ -70,57 +70,48 @@ def extract_text_from_pdf(uploaded_file):
 # ==========================================
 # 4. VISUAL NER HIGHLIGHTING LOGIC
 # ==========================================
-# Define colors for different medical entities to impress the faculty
 ENTITY_COLORS = {
-    "Disease_disorder": "#ffcccc",      # Light Red
-    "Medication": "#cce5ff",            # Light Blue
-    "Sign_symptom": "#ffe5cc",          # Light Orange
-    "Diagnostic_procedure": "#ccffcc"   # Light Green
+    "Disease_disorder": "#ffcccc",      
+    "Medication": "#cce5ff",            
+    "Sign_symptom": "#ffe5cc",          
+    "Diagnostic_procedure": "#ccffcc"   
 }
 
 def highlight_entities(text, entities):
-    """Replaces identified entities in the text with colored HTML tags."""
-    # Sort entities in reverse order of appearance to avoid messing up indices when replacing
     sorted_entities = sorted(entities, key=lambda x: x['start'], reverse=True)
-    
     highlighted_text = text
     for ent in sorted_entities:
         word = text[ent['start']:ent['end']]
         group = ent['entity_group']
-        
-        # Only highlight groups we defined in ENTITY_COLORS
         if group in ENTITY_COLORS:
             color = ENTITY_COLORS[group]
             html_tag = f'<span style="background-color: {color}; padding: 2px 4px; border-radius: 4px; border: 1px solid #ccc; font-weight: 500;" title="{group}">{word} <span style="font-size: 0.6em; color: #555;">[{group}]</span></span>'
-            # Replace precisely using string slicing
             highlighted_text = highlighted_text[:ent['start']] + html_tag + highlighted_text[ent['end']:]
-            
     return highlighted_text
 
 # ==========================================
-# 5. RAG PIPELINE (LANGCHAIN + FAISS + GROQ)
+# 5. MODERN RAG PIPELINE (PURE LCEL)
 # ==========================================
 def process_rag_pipeline(text, target_lang, api_key):
-    # 1. Chunking the text (overlapping chunks help with tabular PDF data)
+    # 1. Chunking
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=150)
     chunks = text_splitter.split_text(text)
     
     # 2. Privacy-First Local Embeddings
-    # We use all-MiniLM-L6-v2 locally so patient data isn't sent to OpenAI/Cloud for embedding
     embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
     
-    # 3. In-Memory Vector DB (FAISS)
+    # 3. In-Memory Vector DB
     vectorstore = FAISS.from_texts(chunks, embeddings)
     retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
     
-    # 4. Initialize LLM via Groq (Fast Inference)
+    # 4. Initialize LLM via Groq
     llm = ChatGroq(
         temperature=0.1, 
-        groq_api_key="api_key", 
-        model_name="llama3-8b-8192"
+        groq_api_key=api_key, 
+        model_name="llama-3.1-8b-instant"
     )
     
-    # 5. ASHA Worker / Patient Prompt Engineering
+    # 5. Prompt Engineering
     system_prompt = (
         "You are a helpful, empathetic medical assistant designed to help patients and rural ASHA workers understand medical reports. "
         "Use the provided context to summarize the patient's test results. "
@@ -137,13 +128,21 @@ def process_rag_pipeline(text, target_lang, api_key):
         ("human", "{input}"),
     ])
     
-    # 6. Create the Retrieval Chain
-    question_answer_chain = create_stuff_documents_chain(llm, prompt)
-    rag_chain = create_retrieval_chain(retriever, question_answer_chain)
+    # 6. Helper function to format retrieved documents
+    def format_docs(docs):
+        return "\n\n".join(doc.page_content for doc in docs)
     
-    # 7. Execute the prompt
-    response = rag_chain.invoke({"input": "Please summarize this medical report, list key findings, and highlight any abnormal values."})
-    return response["answer"]
+    # 7. Create the Modern LCEL Chain (Bypasses the buggy langchain.chains module)
+    rag_chain = (
+        {"context": retriever | format_docs, "input": RunnablePassthrough()}
+        | prompt
+        | llm
+        | StrOutputParser()
+    )
+    
+    # 8. Execute the chain
+    response = rag_chain.invoke("Please summarize this medical report, list key findings, and highlight any abnormal values.")
+    return response
 
 # ==========================================
 # 6. MAIN EXECUTION FLOW
